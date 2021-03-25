@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+      <meta http-equiv="X-UA-Compatible" content="IE=edge">
+      <meta http-equiv="content-type" content="text/html; charset=utf-8">
+
+      <!-- Enable responsiveness on mobile devices-->
+      <!-- viewport-fit=cover is to support iPhone X rounded corners and notch in landscape-->
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover">
+
+      <title>PSP Reverse Engineering HQ</title>
+
+      <!-- CSS -->
+      <link rel="stylesheet" href="https:&#x2F;&#x2F;psp.re&#x2F;print.css" media="print">
+      <link rel="stylesheet" href="https:&#x2F;&#x2F;psp.re&#x2F;poole.css">
+      <link rel="stylesheet" href="https:&#x2F;&#x2F;psp.re&#x2F;hyde.css">
+      <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=PT+Sans:400,400italic,700|Abril+Fatface">
+
+      
+        <link rel="alternate" type="application/atom+xml" title="RSS" href="https://psp.re/atom.xml">
+      
+
+      
+      
+    </head>
+
+    <body class=" ">
+        
+            <div class="sidebar">
+                <div class="container sidebar-sticky">
+                    <div class="sidebar-about">
+                        
+                            <a href="https:&#x2F;&#x2F;psp.re"><h1>PSP Reverse Engineering HQ</h1></a>
+                            
+                            <p class="lead">Your one stop shop for all things PSP Reverse Engineering</p>
+                            
+                        
+                    </div>
+
+                    <ul class="sidebar-nav">
+                        
+                        
+                        <li class="sidebar-nav-item"><a href="&#x2F;">Home</a></li>
+                        
+                        <li class="sidebar-nav-item"><a href="&#x2F;blog">Blog</a></li>
+                        
+                        <li class="sidebar-nav-item"><a href="https:&#x2F;&#x2F;github.com&#x2F;sajattack&#x2F;psp.re">Edit on Github</a></li>
+                        
+                        
+                    </ul>
+                </div>
+            </div>
+        
+
+        <div class="content container">
+            
+<h1 class="title">
+  NID Cracking
+</h1>                
+<span class="subtitle">By Paul Sajna</span><p/>
+<span class="post-date">October 07 2020</span>
+<p><h2 id="what-is-a-nid">What is a NID?</h2>
+<p>A NID, which I believe stands for Name Identifier, is an identifier used in Sony's PRX
+executable format for function imports and exports. They are located in the .rodata.SceNid
+section of every PRX, to identify which operating system or other external functions are
+used in the program. A NID consists of the first 4 little-endian bytes of the SHA-1 hash
+of the function name, and in later versions of the PSP OS, a salt.  Legend has it, 
+they can be bruteforced to discover the names Sony used for their functions, to aid in
+reverse engineering. Experienced cryptographers would have probably realized the problem
+before writing a program to check the results. </p>
+<h2 id="the-problem">The problem</h2>
+<p>So it turns out, there are quite a few hash collisions for the first 4 hexadecimal bytes 
+of a SHA-1 hash. Here are a few of my favourites, which you can check by running 
+<code>echo -n &lt;name&gt; | sha1sum</code>
+on any linux pc (assuming checksum packages are installed). Note that you have to swap 
+endianness (read the bytes backwards). </p>
+<pre style="background-color:#191919;">
+<code><span style="color:#f8f8f2;">7CF05E81 = sceSysregAllocateNotifyRapidHead
+4C0BED71 = sceSysregAbortFatfmtSteepIn
+7CF05E81 = sceSysregActivateDataMbogoPIO
+</span></code></pre>
+<p>I purposely chose two here that came up with the same NID for the function name, to 
+demonstrate the problem of hash collisions. If you're following along at home, run the 
+following at a linux prompt:</p>
+<pre style="background-color:#191919;">
+<code><span style="color:#f8f8f2;">echo -n sceSysregAllocateNotifyRapidHead | sha1sum
+echo -n sceSysregActivateDataMbogoPIO | sha1sum
+</span></code></pre>
+<p>The results are</p>
+<pre style="background-color:#191919;">
+<code><span style="color:#f8f8f2;">815ef07c4b2f44c74cab9af3772c49e49dc41544  -
+815ef07cbd77ac3b13f1813c063aff7794960741  -
+</span></code></pre>
+<p>It is plain to see  that they start with the same 4 bytes (8 characters), and if you
+read the bytes (digit pairs) backwards, you will see the NID. So that's no good, 
+we have multiple possible answers to the same problem, and both of them are nonsensical. 
+I'm unsure how functionnames were ever recovered from NIDs, after working through this.
+I know some of the function names were leaked in <a href="http://psp.re/blog/list/">games with debug symbols</a>,
+but that doesn't account for all the kernel functions that were never used in games
+that have been recovered. Maybe the salts narrow the problem down a bit, I'm not sure.
+I tested without salts, because I was told earlier versions of the kernel didn't use them,
+with NIDs, and it was easier for me not to.</p>
+<h2 id="methods">Methods</h2>
+<p>So, if you want to try your hand at NID cracking, I'll explain what I did in this section.
+I wrote a parallelized <a href="https://rust-lang.org">Rust</a> program that runs on a modern
+desktop CPU. I was planning to later use GPUs for more parallelism/speed, but the 
+ridiculous results I got have me convinced it's not worth persuing further. </p>
+<p>If you're unfamiliar with Rust, you can download it at <a href="https://rustup.rs">https://rustup.rs</a>, and learn how to use it at <a href="https://doc.rust-lang.org/book/">https://doc.rust-lang.org/book/</a></p>
+<p>The (slightly messy) source of my program is below:</p>
+<pre style="background-color:#191919;">
+<code><span style="color:#ff5e5e;">use </span><span style="color:#f8f8f2;">openssl::sha::sha1;
+</span><span style="color:#ff5e5e;">use </span><span style="color:#f8f8f2;">rayon::prelude::</span><span style="color:#ff5e5e;">*</span><span style="color:#f8f8f2;">;
+</span><span style="color:#ff5e5e;">use </span><span style="color:#f8f8f2;">rayon::iter::ParallelBridge;
+</span><span style="color:#ff5e5e;">use </span><span style="color:#f8f8f2;">std::fs::read_to_string;
+</span><span style="color:#ff5e5e;">use </span><span style="color:#f8f8f2;">itertools::Itertools;
+
+</span><span style="font-style:italic;color:#fbdfb5;">fn </span><span style="color:#8cdaff;">main</span><span style="color:#f8f8f2;">() {
+    </span><span style="color:#6d6d6d;">//let module_names_string = read_to_string(&quot;module-names.txt&quot;).unwrap();
+    //let module_names_split = module_names_string.split(&#39;\n&#39;);
+    //let module_names: Vec&lt;&amp;str&gt; = module_names_split.collect();
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> module_name </span><span style="color:#ff5e5e;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">sceSysreg</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">;
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist_string </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">read_to_string</span><span style="color:#f8f8f2;">(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">wordlist.txt</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">).</span><span style="color:#6699cc;">unwrap</span><span style="color:#f8f8f2;">();
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist_split </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> wordlist_string.</span><span style="color:#6699cc;">split</span><span style="color:#f8f8f2;">(</span><span style="color:#ffffff;">&#39;</span><span style="color:#fdb082;">\n</span><span style="color:#ffffff;">&#39;</span><span style="color:#f8f8f2;">);
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist: </span><span style="color:#fbe3bf;">Vec</span><span style="color:#f8f8f2;">&lt;</span><span style="color:#ff5e5e;">&amp;</span><span style="font-style:italic;color:#fbdfb5;">str</span><span style="color:#f8f8f2;">&gt; </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> wordlist_split.</span><span style="color:#6699cc;">collect</span><span style="color:#f8f8f2;">();
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> unknown_nids_string </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">read_to_string</span><span style="color:#f8f8f2;">(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">unknown_nids.txt</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">).</span><span style="color:#6699cc;">unwrap</span><span style="color:#f8f8f2;">();
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> unk_nids_split </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> unknown_nids_string.</span><span style="color:#6699cc;">split</span><span style="color:#f8f8f2;">(</span><span style="color:#ffffff;">&#39;</span><span style="color:#fdb082;">\n</span><span style="color:#ffffff;">&#39;</span><span style="color:#f8f8f2;">);
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> unk_nids: </span><span style="color:#fbe3bf;">Vec</span><span style="color:#f8f8f2;">&lt;</span><span style="color:#ff5e5e;">&amp;</span><span style="font-style:italic;color:#fbdfb5;">str</span><span style="color:#f8f8f2;">&gt; </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> unk_nids_split.</span><span style="color:#6699cc;">collect</span><span style="color:#f8f8f2;">();
+
+    wordlist.</span><span style="color:#6699cc;">par_iter</span><span style="color:#f8f8f2;">().</span><span style="color:#6699cc;">for_each</span><span style="color:#f8f8f2;">(|</span><span style="font-style:italic;color:#fc9354;">word</span><span style="color:#f8f8f2;">| {
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_string </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> module_name.</span><span style="color:#6699cc;">to_string</span><span style="color:#f8f8f2;">() </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> word;
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> hash </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">sha1</span><span style="color:#f8f8f2;">(test_string.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">().</span><span style="color:#6699cc;">as_bytes</span><span style="color:#f8f8f2;">());
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_nid </span><span style="color:#ff5e5e;">= </span><span style="color:#f8f8f2;">format!(
+        </span><span style="color:#ffffff;">&quot;</span><span style="color:#fdb082;">{:02X}{:02X}{:02X}{:02X}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">,
+        hash[</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">],
+        );
+        </span><span style="color:#ff5e5e;">if</span><span style="color:#f8f8f2;"> unk_nids.</span><span style="color:#6699cc;">contains</span><span style="color:#f8f8f2;">(</span><span style="color:#ff5e5e;">&amp;</span><span style="color:#f8f8f2;">test_nid.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">()) {
+            println!(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">found match: </span><span style="color:#fdb082;">{}</span><span style="color:#fbe3bf;"> = </span><span style="color:#fdb082;">{}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">, test_nid, test_string);
+        }
+    });
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist_2perms </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> wordlist
+        .</span><span style="color:#6699cc;">iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">permutations</span><span style="color:#f8f8f2;">(</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">)
+        .</span><span style="color:#6699cc;">into_iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">par_bridge</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">into_par_iter</span><span style="color:#f8f8f2;">();
+
+    wordlist_2perms.</span><span style="color:#6699cc;">for_each</span><span style="color:#f8f8f2;">(|</span><span style="font-style:italic;color:#fc9354;">perm</span><span style="color:#f8f8f2;">| {
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_string </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> module_name.</span><span style="color:#6699cc;">to_string</span><span style="color:#f8f8f2;">() </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">];
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> hash </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">sha1</span><span style="color:#f8f8f2;">(test_string.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">().</span><span style="color:#6699cc;">as_bytes</span><span style="color:#f8f8f2;">());
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_nid </span><span style="color:#ff5e5e;">= </span><span style="color:#f8f8f2;">format!(
+        </span><span style="color:#ffffff;">&quot;</span><span style="color:#fdb082;">{:02X}{:02X}{:02X}{:02X}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">,
+        hash[</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">],
+        );
+        </span><span style="color:#ff5e5e;">if</span><span style="color:#f8f8f2;"> unk_nids.</span><span style="color:#6699cc;">contains</span><span style="color:#f8f8f2;">(</span><span style="color:#ff5e5e;">&amp;</span><span style="color:#f8f8f2;">test_nid.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">()) {
+            println!(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">found match: </span><span style="color:#fdb082;">{}</span><span style="color:#fbe3bf;"> = </span><span style="color:#fdb082;">{}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">, test_nid, test_string);
+        }
+    });
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist_3perms </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> wordlist
+        .</span><span style="color:#6699cc;">iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">permutations</span><span style="color:#f8f8f2;">(</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">)
+        .</span><span style="color:#6699cc;">into_iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">par_bridge</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">into_par_iter</span><span style="color:#f8f8f2;">();
+
+    wordlist_3perms.</span><span style="color:#6699cc;">for_each</span><span style="color:#f8f8f2;">(|</span><span style="font-style:italic;color:#fc9354;">perm</span><span style="color:#f8f8f2;">| {
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_string </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> module_name.</span><span style="color:#6699cc;">to_string</span><span style="color:#f8f8f2;">() </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">];
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> hash </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">sha1</span><span style="color:#f8f8f2;">(test_string.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">().</span><span style="color:#6699cc;">as_bytes</span><span style="color:#f8f8f2;">());
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_nid </span><span style="color:#ff5e5e;">= </span><span style="color:#f8f8f2;">format!(
+        </span><span style="color:#ffffff;">&quot;</span><span style="color:#fdb082;">{:02X}{:02X}{:02X}{:02X}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">,
+        hash[</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">],
+        );
+        </span><span style="color:#ff5e5e;">if</span><span style="color:#f8f8f2;"> unk_nids.</span><span style="color:#6699cc;">contains</span><span style="color:#f8f8f2;">(</span><span style="color:#ff5e5e;">&amp;</span><span style="color:#f8f8f2;">test_nid.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">()) {
+            println!(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">found match: </span><span style="color:#fdb082;">{}</span><span style="color:#fbe3bf;"> = </span><span style="color:#fdb082;">{}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">, test_nid, test_string);
+        }
+    });
+
+    </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> wordlist_4perms </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> wordlist
+        .</span><span style="color:#6699cc;">iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">permutations</span><span style="color:#f8f8f2;">(</span><span style="color:#fdb082;">4</span><span style="color:#f8f8f2;">)
+        .</span><span style="color:#6699cc;">into_iter</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">par_bridge</span><span style="color:#f8f8f2;">()
+        .</span><span style="color:#6699cc;">into_par_iter</span><span style="color:#f8f8f2;">();
+
+    wordlist_4perms.</span><span style="color:#6699cc;">for_each</span><span style="color:#f8f8f2;">(|</span><span style="font-style:italic;color:#fc9354;">perm</span><span style="color:#f8f8f2;">| {
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_string </span><span style="color:#ff5e5e;">=</span><span style="color:#f8f8f2;"> module_name.</span><span style="color:#6699cc;">to_string</span><span style="color:#f8f8f2;">() </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">] </span><span style="color:#ff5e5e;">+</span><span style="color:#f8f8f2;"> perm[</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">];
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> hash </span><span style="color:#ff5e5e;">= </span><span style="color:#6699cc;">sha1</span><span style="color:#f8f8f2;">(test_string.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">().</span><span style="color:#6699cc;">as_bytes</span><span style="color:#f8f8f2;">());
+        </span><span style="font-style:italic;color:#fbdfb5;">let</span><span style="color:#f8f8f2;"> test_nid </span><span style="color:#ff5e5e;">= </span><span style="color:#f8f8f2;">format!(
+        </span><span style="color:#ffffff;">&quot;</span><span style="color:#fdb082;">{:02X}{:02X}{:02X}{:02X}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">,
+        hash[</span><span style="color:#fdb082;">3</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">2</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">1</span><span style="color:#f8f8f2;">], hash[</span><span style="color:#fdb082;">0</span><span style="color:#f8f8f2;">],
+        );
+        </span><span style="color:#ff5e5e;">if</span><span style="color:#f8f8f2;"> unk_nids.</span><span style="color:#6699cc;">contains</span><span style="color:#f8f8f2;">(</span><span style="color:#ff5e5e;">&amp;</span><span style="color:#f8f8f2;">test_nid.</span><span style="color:#6699cc;">as_str</span><span style="color:#f8f8f2;">()) {
+            println!(</span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">found match: </span><span style="color:#fdb082;">{}</span><span style="color:#fbe3bf;"> = </span><span style="color:#fdb082;">{}</span><span style="color:#ffffff;">&quot;</span><span style="color:#f8f8f2;">, test_nid, test_string);
+        }
+    });
+}
+</span></code></pre>
+<p>I hard-coded the module name to look for functions of the sceSysreg module for this first
+test, and was planning to cover other modules as well. The program then uses rayon's parallel iterator and itertools to calculate permutations of a wordlist, and calculates hashes of the permuations with openssl. I used a python program to build a wordlist from known nids (basically splitting camelcase into words), and got some unknown nids from the emulator 
+<a href="https://github.com/jpcsp/jpcsp/blob/d4c891ec1e9ba820a70a9f17ba0af3295b593c6b/src/jpcsp/HLE/modules/sceSysreg.java">JPCSP</a>. My wordlist is at <a href="https://psp.re/wordlist.txt">https://psp.re/wordlist.txt</a> and the nids I chose to crack are at <a href="https://psp.re/unknown_nids.txt">https://psp.re/unknown_nids.txt</a></p>
+<p>Rust projects also have a Cargo.toml file with basic metadata, which I will supply below</p>
+<pre style="background-color:#191919;">
+<code><span style="color:#f8f8f2;">[package]
+</span><span style="color:#ff5e5e;">name </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">nidcracker</span><span style="color:#ffffff;">&quot;
+</span><span style="color:#ff5e5e;">version </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">0.1.0</span><span style="color:#ffffff;">&quot;
+</span><span style="color:#ff5e5e;">authors </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">[&quot;</span><span style="color:#fbe3bf;">Paul Sajna &lt;sajattack@gmail.com&gt;</span><span style="color:#ffffff;">&quot;]
+</span><span style="color:#ff5e5e;">edition </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">2018</span><span style="color:#ffffff;">&quot;
+
+</span><span style="color:#f8f8f2;">[dependencies]
+</span><span style="color:#ff5e5e;">openssl </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">0.10</span><span style="color:#ffffff;">&quot;
+</span><span style="color:#ff5e5e;">rayon </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">1.4.1</span><span style="color:#ffffff;">&quot;
+</span><span style="color:#ff5e5e;">itertools </span><span style="color:#f8f8f2;">= </span><span style="color:#ffffff;">&quot;</span><span style="color:#fbe3bf;">0.8.2</span><span style="color:#ffffff;">&quot;
+</span></code></pre>
+<p>The latest version of the code is available at <a href="https://github.com/sajattack/nidcracker">https://github.com/sajattack/nidcracker</a>.
+Build the project like any other rust project, with <code>cargo build --release</code>, and the binary
+will be output as target/release/nidcracker.</p>
+<p>So I ran all this for a few hours, and you can see my results at <a href="https://gist.github.com/sajattack/dd4c6df4aec0de8b641216515bdc49ed">https://gist.github.com/sajattack/dd4c6df4aec0de8b641216515bdc49ed</a></p>
+<h2 id="conclusion">Conclusion</h2>
+<p>I'm not really sure where to go from here. The results are nonsensical so I will have to
+find another way to uncover kernel function names. If you have any suggestions feel free
+to contact me on <a href="https://twitter.com/sajattack">Twitter</a>.</p>
+</p>
+
+        </div>
+
+    </body>
+
+</html>
